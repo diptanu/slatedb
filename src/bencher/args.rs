@@ -36,6 +36,13 @@ pub(crate) struct BencherArgs {
     )]
     pub(crate) path: String,
 
+    #[arg(
+        long,
+        help = "Clean up object storage files after the benchmark run completes",
+        default_value_t = false
+    )]
+    pub(crate) clean: bool,
+
     #[command(subcommand)]
     pub(crate) command: BencherCommands,
 }
@@ -53,6 +60,7 @@ pub(crate) struct DbArgs {
         help = "Optional path to load the DbOptions configuration from. `Slatedb.toml` is used by default if this option is not present"
     )]
     db_options_path: Option<PathBuf>,
+
     #[arg(long, help = "The size in bytes of the block cache.")]
     pub(crate) block_cache_size: Option<u64>,
 }

@@ -50,7 +50,7 @@
 //! filter_bits_per_key = 10
 //! l0_sst_size_bytes = 67108864
 //! l0_max_ssts = 8
-//! max_unflushed_memtable = 2
+//! max_unflushed_bytes = 536870912
 //!
 //! [compactor_options]
 //! poll_interval = "5s"
@@ -87,7 +87,7 @@
 //!  "filter_bits_per_key": 10,
 //!  "l0_sst_size_bytes": 67108864,
 //!  "l0_max_ssts": 8,
-//!  "max_unflushed_memtable": 2,
+//!  "max_unflushed_bytes": 536870912,
 //!  "compactor_options": {
 //!    "poll_interval": "5s",
 //!    "max_sst_size": 1073741824,
@@ -127,7 +127,7 @@
 //! filter_bits_per_key: 10
 //! l0_sst_size_bytes: 67108864
 //! l0_max_ssts: 8
-//! max_unflushed_memtable: 2
+//! max_unflushed_bytes: 536870912
 //! compactor_options:
 //!   poll_interval: '5s'
 //!   max_sst_size: 1073741824
@@ -161,14 +161,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{str::FromStr, time::Duration};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::compactor::CompactionScheduler;
+use crate::config::GcExecutionMode::Periodic;
 use crate::error::{DbOptionsError, SlateDBError};
 
 use crate::db_cache::DbCache;
 use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 
 pub const DEFAULT_READ_OPTIONS: &ReadOptions = &ReadOptions::default();
+pub const DEFAULT_SCAN_OPTIONS: &ScanOptions = &ScanOptions::default();
 pub const DEFAULT_WRITE_OPTIONS: &WriteOptions = &WriteOptions::default();
 pub const DEFAULT_PUT_OPTIONS: &PutOptions = &PutOptions::default();
 
@@ -176,8 +179,10 @@ pub const DEFAULT_PUT_OPTIONS: &PutOptions = &PutOptions::default();
 /// write is considered durably committed if all future calls to read are guaranteed
 /// to serve the data written by the write, until some later durably committed write
 /// updates the same key.
+#[derive(Clone, Default)]
 pub enum ReadLevel {
     /// Client reads will only see data that's been committed durably to the DB.
+    #[default]
     Commited,
 
     /// Clients will see all writes, including those not yet durably committed to the
@@ -187,16 +192,39 @@ pub enum ReadLevel {
 
 /// Configuration for client read operations. `ReadOptions` is supplied for each
 /// read call and controls the behavior of the read.
+#[derive(Clone, Default)]
 pub struct ReadOptions {
     /// The read commit level for read operations.
     pub read_level: ReadLevel,
 }
 
 impl ReadOptions {
-    /// Create a new ReadOptions with `read_level` set to `Commited`.
+    /// Create a new `ReadOptions` with `read_level` set to `Commited`.
     const fn default() -> Self {
         Self {
             read_level: ReadLevel::Commited,
+        }
+    }
+}
+
+pub struct ScanOptions {
+    /// The read commit level for read operations
+    pub read_level: ReadLevel,
+    /// The number of bytes to read ahead. The value is rounded up to the nearest
+    /// block size when fetching from object storage. The default is 1, which
+    /// rounds up to one block.
+    pub read_ahead_bytes: usize,
+    /// Whether or not fetched blocks should be cached
+    pub cache_blocks: bool,
+}
+
+impl ScanOptions {
+    /// Create a new ScanOptions with `read_level` set to [`ReadLevel::Commited`].
+    pub const fn default() -> Self {
+        Self {
+            read_level: ReadLevel::Commited,
+            read_ahead_bytes: 1,
+            cache_blocks: false,
         }
     }
 }
@@ -305,6 +333,44 @@ fn default_clock() -> Arc<dyn Clock + Send + Sync> {
     })
 }
 
+/// Defines the scope targeted by a given checkpoint. If set to All, then the checkpoint will
+/// include all writes that were issued at the time that create_checkpoint is called. If force_flush
+/// is true, then SlateDB will force the current wal, or memtable if wal_enabled is false, to flush
+/// its data. Otherwise, the database will wait for the current wal or memtable to be flushed due to
+/// flush_interval or reaching l0_sst_size_bytes, respectively. If set to Durable, then the
+/// checkpoint includes only writes that were durable at the time of the call. This will be faster,
+/// but may not include data from recent writes.
+pub enum CheckpointScope {
+    All { force_flush: bool },
+    Durable,
+}
+
+/// Specify options to provide when creating a checkpoint.
+pub struct CheckpointOptions {
+    /// Specifies the scope targeted by the checkpoint (see above)
+    pub scope: CheckpointScope,
+
+    /// Optionally specifies the lifetime of the checkpoint to create. The expire time will be
+    /// set to the current wallclock time plus the specified lifetime. If lifetime is None, then
+    /// the checkpoint is created without an expiry time.
+    pub lifetime: Option<Duration>,
+
+    /// Optionally specifies an existing checkpoint to use as the source for this checkpoint. This
+    /// is useful for users to establish checkpoints from existing checkpoints, but with a different
+    /// lifecycle and/or metadata.
+    pub source: Option<Uuid>,
+}
+
+impl Default for CheckpointOptions {
+    fn default() -> Self {
+        Self {
+            scope: CheckpointScope::Durable,
+            lifetime: None,
+            source: None,
+        }
+    }
+}
+
 /// Configuration options for the database. These options are set on client startup.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct DbOptions {
@@ -388,9 +454,12 @@ pub struct DbOptions {
     /// l0 ssts than this value, until compaction can compact the ssts into compacted.
     pub l0_max_ssts: usize,
 
-    /// Defines the max number of unflushed memtables. Writes will be paused if there
-    /// are more unflushed memtables than this value
-    pub max_unflushed_memtable: usize,
+    /// Defines the max number of unflushed key/value pair bytes that should reside in memory
+    /// before applying backpressure to writers. This includes key/value pairs in both the
+    /// immutable WAL flush queue and the immutable memtable flush queue. Writes will be
+    /// paused if the total number of unflushed bytes exceeds this value until data is flushed
+    /// to object storage.
+    pub max_unflushed_bytes: usize,
 
     /// Configuration options for the compactor.
     pub compactor_options: Option<CompactorOptions>,
@@ -422,7 +491,41 @@ pub struct DbOptions {
     pub default_ttl: Option<u64>,
 }
 
+// Implement Debug manually for DbOptions.
+// This is needed because DbOptions contains several boxed trait objects
+// which doesn't implement Debug.
+impl std::fmt::Debug for DbOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut data = f.debug_struct("DbOptions");
+        data.field("flush_interval", &self.flush_interval);
+        #[cfg(feature = "wal_disable")]
+        {
+            data.field("wal_enabled", &self.wal_enabled);
+        }
+        data.field("manifest_poll_interval", &self.manifest_poll_interval)
+            .field("min_filter_keys", &self.min_filter_keys)
+            .field("max_unflushed_bytes", &self.max_unflushed_bytes)
+            .field("l0_sst_size_bytes", &self.l0_sst_size_bytes)
+            .field("l0_max_ssts", &self.l0_max_ssts)
+            .field("compactor_options", &self.compactor_options)
+            .field("compression_codec", &self.compression_codec)
+            .field(
+                "object_store_cache_options",
+                &self.object_store_cache_options,
+            )
+            .field("garbage_collector_options", &self.garbage_collector_options)
+            .field("filter_bits_per_key", &self.filter_bits_per_key)
+            .field("default_ttl", &self.default_ttl)
+            .finish()
+    }
+}
+
 impl DbOptions {
+    /// Converts the DbOptions to a JSON string representation
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
     /// Loads DbOptions from a file.
     ///
     /// This function attempts to read and parse a configuration file to create a DbOptions instance.
@@ -560,8 +663,8 @@ impl Default for DbOptions {
             wal_enabled: true,
             manifest_poll_interval: Duration::from_secs(1),
             min_filter_keys: 1000,
+            max_unflushed_bytes: 1_073_741_824,
             l0_sst_size_bytes: 64 * 1024 * 1024,
-            max_unflushed_memtable: 2,
             l0_max_ssts: 8,
             compactor_options: Some(CompactorOptions::default()),
             compression_codec: None,
@@ -654,14 +757,6 @@ pub struct CompactorOptions {
     /// this to isolate compactions to a dedicated thread pool.
     #[serde(skip)]
     pub compaction_runtime: Option<Handle>,
-
-    /// The Clock to use for determining the time the compaction has run. This
-    /// helps determine actions such as expiring data with a configured time-to-live.
-    ///
-    /// Default: the default clock uses the local system time on the machine
-    #[serde(skip)]
-    #[serde(default = "default_clock")]
-    pub clock: Arc<dyn Clock + Send + Sync>,
 }
 
 /// Default options for the compactor. Currently, only a
@@ -676,8 +771,23 @@ impl Default for CompactorOptions {
             compaction_scheduler: default_compaction_scheduler(),
             max_concurrent_compactions: 4,
             compaction_runtime: None,
-            clock: default_clock(),
         }
+    }
+}
+
+// Implement Debug manually for CompactorOptions.
+// This is needed because CompactorOptions contains a boxed trait object
+// (`Arc<dyn CompactionSchedulerSupplier>`), which doesn't implement Debug.
+impl std::fmt::Debug for CompactorOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactorOptions")
+            .field("poll_interval", &self.poll_interval)
+            .field("max_sst_size", &self.max_sst_size)
+            .field(
+                "max_concurrent_compactions",
+                &self.max_concurrent_compactions,
+            )
+            .finish()
     }
 }
 
@@ -721,7 +831,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
 }
 
 /// Garbage collector options.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GarbageCollectorOptions {
     /// Garbage collection options for the manifest directory.
     pub manifest_options: Option<GarbageCollectorDirectoryOptions>,
@@ -741,19 +851,30 @@ pub struct GarbageCollectorOptions {
 impl Default for GarbageCollectorDirectoryOptions {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(300),
+            execution_mode: Periodic(Duration::from_secs(300)),
             min_age: Duration::from_secs(86_400),
         }
     }
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, Debug)]
+#[serde(tag = "mode", content = "config")]
+pub enum GcExecutionMode {
+    /// Run garbage collection once.
+    Once,
+
+    /// Run garbage collection periodically.
+    Periodic(
+        #[serde(deserialize_with = "deserialize_duration")]
+        #[serde(serialize_with = "serialize_duration")]
+        Duration,
+    ),
+}
+
 /// Garbage collector options for a directory.
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct GarbageCollectorDirectoryOptions {
-    /// The interval at which the garbage collector checks for files to garbage collect.
-    #[serde(deserialize_with = "deserialize_duration")]
-    #[serde(serialize_with = "serialize_duration")]
-    pub poll_interval: Duration,
+    pub execution_mode: GcExecutionMode,
 
     /// The minimum age of a file before it can be garbage collected.
     #[serde(deserialize_with = "deserialize_duration")]
@@ -770,7 +891,7 @@ impl Default for GarbageCollectorOptions {
         Self {
             manifest_options: Some(Default::default()),
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                poll_interval: Duration::from_secs(60),
+                execution_mode: Periodic(Duration::from_secs(60)),
                 min_age: Duration::from_secs(60),
             }),
             compacted_options: Some(Default::default()),
